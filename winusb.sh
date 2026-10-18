@@ -18,9 +18,11 @@ fi
 ISO="${1:-}"
 MNT_ISO=$(mktemp -d /tmp/winusb-iso.XXXX)
 MNT_USB=$(mktemp -d /tmp/winusb-usb.XXXX)
+TMPD=""
 
 cleanup() {
     set +e
+    [[ -n "$TMPD" ]] && rm -rf "$TMPD"
     sync
     mountpoint -q "$MNT_USB" && umount "$MNT_USB"
     mountpoint -q "$MNT_ISO" && umount "$MNT_ISO"
@@ -104,16 +106,28 @@ mount -o loop,ro "$ISO" "$MNT_ISO"
 mount "$PART" "$MNT_USB"
 
 echo "[4/5] copying"
-WIM="$MNT_ISO/sources/install.wim"
-rsync -rh --info=progress2 --no-perms --no-owner --no-group --exclude='sources/install.wim' "$MNT_ISO"/ "$MNT_USB"/
-if [[ -f "$WIM" ]]; then
-    if (( $(stat -c %s "$WIM") > 4294967295 )); then
-        echo "install.wim over 4gb, splitting"
-        wimlib-imagex split "$WIM" "$MNT_USB/sources/install.swm" 3800
-    else
-        cp "$WIM" "$MNT_USB/sources/install.wim"
+rsync -rh --info=progress2 --no-perms --no-owner --no-group \
+    --exclude='sources/install.wim' --exclude='sources/install.esd' "$MNT_ISO"/ "$MNT_USB"/
+for f in install.wim install.esd; do
+    SRC="$MNT_ISO/sources/$f"
+    [[ -f "$SRC" ]] || continue
+    if (( $(stat -c %s "$SRC") <= 4294967295 )); then
+        cp "$SRC" "$MNT_USB/sources/$f"
+        continue
     fi
-fi
+    if [[ "$f" == install.esd ]]; then
+        # fat32 cannot hold it and wimlib cannot split esd, so convert to a plain wim first
+        echo "$f over 4gb, converting to wim (slow)"
+        need=$(( $(stat -c %s "$SRC") * 2 ))
+        avail=$(df --output=avail -B1 /var/tmp | tail -1)
+        (( avail >= need )) || { echo "need $((need / 1073741824))gb free in /var/tmp"; exit 1; }
+        TMPD=$(mktemp -d /var/tmp/winusb-wim.XXXX)
+        wimlib-imagex export "$SRC" all "$TMPD/install.wim" --compress=LZX
+        SRC="$TMPD/install.wim"
+    fi
+    echo "splitting into 3800mb parts"
+    wimlib-imagex split "$SRC" "$MNT_USB/sources/install.swm" 3800
+done
 
 echo "[5/5] flushing"
 sync
